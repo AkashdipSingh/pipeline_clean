@@ -1,0 +1,537 @@
+---
+title: "Pipeline - Part 1 - predicted inhibitory receptors"
+author: "Akashdip Singh"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE,
+                      tidy = TRUE)
+knitr::opts_knit$set(root.dir = "..")
+
+```
+
+## load libraries and stuff
+
+```{r}
+library(biomaRt)
+library(tidyverse)
+library(Biostrings)
+library(bio3d)
+library(gtools)
+library(stringi)
+library(BiocManager)
+library(readxl)
+library(ggpubr)
+
+todate <- format(Sys.Date(),"%y%m%d")
+todate <- 221218
+
+dataF <- file.path("./data",todate,"/")
+plotsF <- file.path("./plots",todate,"/")
+outputF <- file.path("./output",todate,"/")
+processedF <- file.path("./processed",todate,"/")
+folders <- c(dataF,plotsF,outputF,processedF)
+for(folder in folders){
+  if(!dir.exists(folder)){
+    dir.create(folder,recursive = TRUE)
+  }
+}
+
+knownr <- read_lines("./data/known_receptors.txt")
+
+ensembl <- useMart("ensembl",
+                   host = "https://dec2021.archive.ensembl.org",
+                   dataset = "hsapiens_gene_ensembl")
+
+```
+
+## functions
+
+```{r}
+
+check_knowns <- function(x){
+  if(!is.vector(x)){
+    print("input peptide IDs as vector")
+  }
+  
+  if(!exists("annotation_known")){
+    
+    annotation_known <<- getBM(attributes = c("ensembl_peptide_id", "hgnc_symbol", "uniprotswissprot"),
+                              filters = "hgnc_symbol",
+                              values = knownr,
+                              mart = ensembl) %>%
+      dplyr::rename("gene_symbol" = "hgnc_symbol",
+                    "peptide_id" = "ensembl_peptide_id",
+                    "uniprot_id" = "uniprotswissprot")
+  }
+  
+  if (exists("annotation_known")) {
+    genes_found <- annotation_known %>%
+      filter(peptide_id %in% x) %>%
+      pull(gene_symbol) %>%
+      unique()
+    if (length(genes_found) > 1) {
+      test <- knownr %in% genes_found %>%
+        all
+      if (test) {
+        print("All known genes still in there")
+        return(test)
+      } else{
+        print("Following known genes are now missing:")
+        return(setdiff(knownr,unique(genes_found)))
+      }
+    }else
+      print("error")
+  }
+}
+
+collapse_list <- function(x) {
+  x <- as.data.frame(x) %>%
+    mutate(a = paste(start, end, sep = "-"),
+           b = paste(a, collapse = "|"))
+  x <- x[1, "b"]
+  return(x)
+} 
+
+```
+
+## import ensembl for topology prediction
+
+There are multiple methods to determine protein topology based on amino acid sequence. However, based on literature and also with the old pipeline in mind, I decided to use [TOPCONS](https://doi.org/10.1093/nar/gkv485). A good alternative would be "DeepTMHMM", which has to be run on Linux
+
+First thing was to retrieve all peptide sequences from a database, went for ensembl and all ensembl_peptide_ids for this. Sequences were filtered for ITIMsequence to already cut down on number of sequences that have to be run. The remaining sequences in the .fa fasta file have then to be loaded into TOPCONS (run rst_ekt3evqo, done on 24-06-2022)
+
+```{r}
+
+# all_peptide_IDs <- getBM(attributes = "ensembl_peptide_id",
+#                      mart = ensembl)[,1]
+# 
+# all_peptides <- getSequence(id = all_peptide_IDs,
+#                         type = "ensembl_peptide_id",
+#                         seqType = "peptide",
+#                         mart = ensembl)
+# 
+# saveRDS(all_peptides,
+#         file = paste0("./processed/",todate,"_all_peptide_sequences.rds"))
+
+#don't want to load in again every time, takes some time
+
+ITIMseq <- "[VLIST].Y..[ILV]"
+
+fasta_file <- paste0(outputF, todate, "_peptides_anyITIM.fa")
+if(!file.exists(fasta_file)) {
+  all_peptides <- readRDS("./processed/221218_all_peptide_sequences.rds")
+  
+  check_knowns(all_peptides$ensembl_peptide_id)
+
+  peptides_anyITIM <- all_peptides %>%
+    filter(str_detect(peptide, ITIMseq))
+  rm(all_peptides)
+  
+  peptides_anyITIM %>%
+    exportFASTA(fasta_file)
+
+  saveRDS(peptides_anyITIM, paste0(processedF,"peptides_anyITIM.rds"))
+}
+
+```
+
+## import TOPCONS topology data
+
+After the TOPCONS run, we get a file with all the predicted protein topologies. Those were all loaded in, filtered only for those containing transmembrane domains. 
+
+Of the 44.695 that were loaded into TOPCONS (7 were excluded, because of size >10.000 AA), we have 13.625 membrane proteins, of which x are multispanners. 
+
+```{r}
+
+if(!file.exists(paste0(processedF,"topologies_anyITIM.rds"))){
+
+  peptides_anyITIM <- readRDS(paste0(processedF,"peptides_anyITIM.rds")) %>%
+    dplyr::rename("peptide_id" = "ensembl_peptide_id") %>%
+    dplyr::select(peptide_id, peptide) %>% 
+    as_tibble()
+
+  check_knowns(peptides_anyITIM$peptide_id)
+
+  topcons_result <- read_lines("./data/rst_ekt3evqo/220624_topcons_results.txt",
+                             skip = 4)
+
+  topologies_anyITIM <- tibble(peptide_id = gsub("Sequence name: ","",
+                                    topcons_result[grep("Sequence name:", topcons_result)]),
+                               psequence = topcons_result[grep("Sequence:",topcons_result)+1],
+                               topology = topcons_result[grep("TOPCONS predicted topology:",topcons_result)+1]) %>%
+    filter(grepl("M",topology)) %>%
+    mutate(TMdomains = str_count(topology,"M+"))
+
+
+  rm(topcons_result)
+  rm(peptides_anyITIM)
+  
+  check_knowns(topologies_anyITIM$peptide_id)
+  
+  topologies_anyITIM %>%
+    group_by(multiTM = TMdomains > 1) %>%
+    summarise(n = n())
+
+  saveRDS(topologies_anyITIM,
+        file = paste0(processedF,"topologies_anyITIM.rds"))
+
+}else{
+  
+  topologies_anyITIM <- readRDS(paste0(processedF,"topologies_anyITIM.rds"))
+
+}
+
+
+```
+
+## IC ITIM/ITSM filtering
+
+Next step is to only continue with proteins that actually have their ITIM in the intracellular domain
+
+```{r}
+
+if(!file.exists(paste0(processedF,"topologies_innerITIM.rds"))){
+  
+innerITIM <- list()
+for(i in 1:nrow(topologies_anyITIM)){
+  print(paste0(i,"/",nrow(topologies_anyITIM)," sequences"))
+
+  pseq <- topologies_anyITIM[i,"psequence"]
+  topo <- topologies_anyITIM[i,"topology"]
+
+  ITIM_locs <- str_locate_all(pseq,ITIMseq)[[1]]
+  
+  ITIMdet_inner <- c()
+  print(ITIM_locs)
+  for (j in 1:nrow(ITIM_locs)) {
+    ITIMdet_inner <- c(ITIMdet_inner,
+                       substring(topo, ITIM_locs[j, "start"], ITIM_locs[j, "end"]) == "iiiiii")
+  }
+  innerITIM[[i]] <- any(ITIMdet_inner)
+  names(innerITIM[[i]]) <- topologies_anyITIM[i,"peptide_id"]
+}
+
+sel_innerITIM <- unlist(innerITIM)
+
+peptides_innerITIM <- names(sel_innerITIM)[sel_innerITIM]
+
+topologies_innerITIM <- topologies_anyITIM %>% 
+  filter(peptide_id %in% peptides_innerITIM)
+
+check_knowns(topologies_innerITIM$peptide_id)
+
+topologies_innerITIM %>%
+  group_by(multiTM = TMdomains > 1) %>%
+  summarise(n = n())
+
+saveRDS(topologies_innerITIM,
+        file = paste0(processedF,"topologies_innerITIM.rds"))
+
+}else{
+  topologies_innerITIM <- readRDS(paste0(processedF,"topologies_innerITIM.rds"))
+}
+
+
+
+```
+
+## annotate gene symbols
+
+These 5012 peptides are now the ones containing an intracellular ITIM, so we check how many genes this corresponds to which could be considered true intracellular ITIM-bearing transmembrane receptors
+
+```{r}
+
+annotation_all <- getBM(attributes = c("ensembl_peptide_id","hgnc_symbol"),
+                    filters = "ensembl_peptide_id",
+                    values = topologies_innerITIM$peptide_id,
+                    mart = ensembl) %>%
+  dplyr::rename("gene_symbol" = "hgnc_symbol",
+                "peptide_id" = "ensembl_peptide_id")
+
+## Some KIR family members have two peptides corresponding to two gene symbols
+topologies_annot <- topologies_innerITIM %>%
+  left_join(annotation_all, by = "peptide_id") %>% 
+  filter(!duplicated(peptide_id),
+         !gene_symbol == "") %>%
+  mutate(peptide_gene = paste(peptide_id, gene_symbol, sep = "_"))
+
+new_receptors <- topologies_annot %>% 
+  pull(gene_symbol) %>%
+  unique() %>%
+  mixedsort()
+
+new_receptors %>% 
+  write_lines(paste0(outputF,todate,"_all_IIR_genes.txt"))
+
+length(new_receptors)
+
+```
+
+## annotate protein domains
+
+To be able to determine the intracellular domains and shuffle them later, we add annotation for the location of all the domains, and have separate columns for every inner domain
+
+```{r}
+
+TMlocations <- str_locate_all(topologies_annot$topology, "M+")
+innerlocations <- str_locate_all(topologies_annot$topology, "i+")
+outerlocations <- str_locate_all(topologies_annot$topology, "o+")
+
+innersequences <- list()
+for (i in 1:(length(topologies_annot$psequence))) {
+  innersequences[[i]] <- str_sub(topologies_annot$psequence[i], innerlocations[[i]])
+}
+
+if(!file.exists(paste0(processedF,"df_domains.rds"))){
+  df_domains <- topologies_annot %>%
+    mutate(TM_localisation = sapply(TMlocations, collapse_list),
+           inner_localisation = sapply(innerlocations, collapse_list),
+           inner_sequences = sapply(innersequences, function(x) paste(x, collapse = "|")),
+           known = case_when(gene_symbol %in% knownr ~ "known",
+                             !gene_symbol %in% knownr ~ "unknown"),
+           actual_ITIM = str_count(inner_sequences, pattern = "[VLIST][:alpha:]Y[:alpha:]{2}[ILV]")) %>%
+    separate(inner_sequences, into = paste0("inner_seq", 1:(max(str_count(.$inner_sequences, "\\|")) + 1)))
+  
+  saveRDS(df_domains, paste0(processedF,"df_domains.rds"))
+
+}else{
+  df_domains <- readRDS(paste0(processedF,"df_domains.rds"))
+}
+
+```
+
+## determine likelihood analysis
+
+To filter on proteins with an increased chance to find an ITIM by chance, we perform permutating testing. We just shuffle the protein and determine how many ITIMs we find back in the permutations comapred to the regular sequence
+
+Had to add a fixed seed to make every run comparable
+
+```{r}
+
+set.seed(020841)
+n_perm <- 10000
+
+if(!file.exists(paste0(processedF, "df_odds",n_perm,".rds"))){
+  permut_counts <- list()
+  for (i in 1:n_perm) {
+      print(paste(i,"/",n_perm,"permutations done"))
+      df_int <- df_domains %>%
+        mutate(
+          across(contains("inner_seq"),
+               list(permut = stri_rand_shuffle)),
+          across(contains("permut"),
+               list(ITIMcount = function(x) str_count(x, ITIMseq))),
+          permut_count = rowSums(across(contains("ITIMcount")), na.rm = TRUE),
+          more = permut_count >= actual_ITIM)
+    
+      permut_counts[[i]] <- df_int$more
+  }
+
+  df_odds <- df_int %>%
+    dplyr::select(-contains(c("permut","more"))) %>% 
+    unite("inner_sequences", contains("inner_seq")) %>% 
+    mutate(total_odds = Reduce(`+`,permut_counts)/n_perm,
+           odds_filt = case_when(total_odds < 0.25 ~ "incl",
+                               total_odds >= 0.25 ~ "excl"),
+           TMtype = case_when(str_count(TM_localisation,"\\|") >= 1 ~ "multi",
+                            str_count(TM_localisation,"\\|") == 0 & str_detect(topology,"^[So]") ~ "type1",
+                            str_count(TM_localisation,"\\|") == 0 & str_detect(topology,"^i") ~ "type2"),
+           total_length = nchar(innersequences)-(TMdomains-1))
+  
+  saveRDS(df_odds, paste0(processedF, "df_odds",n_perm,".rds"))
+} else {
+  df_odds <- readRDS(paste0(processedF, "df_odds",n_perm,".rds"))
+}
+
+```
+
+## figures + data odds
+
+```{r}
+
+df_odds %>%
+  mutate(plotting = case_when(known == "known" ~ "known",
+                              !known == "known" & TMtype == "multi" ~ "multi_unknown",
+                              TRUE ~ "single_unknown"),
+         plotting = factor(plotting, levels = c("known", "single_unknown", "multi_unknown"))) %>% 
+  ggplot(mapping = aes(x = gene_symbol, y = total_odds)) +
+  facet_wrap(~ plotting, scales = "free_x") +
+  geom_hline(yintercept = 0.25) +
+  geom_hline(yintercept = 0.05, alpha = 0.3) +
+  stat_boxplot(geom = "errorbar") +
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 1)) +
+  scale_color_manual(values = c("gray50","black")) +
+  guides(color = "none") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+if(!file.exists(paste0(plotsF,todate,"_ITIModds.png"))){
+ggsave(paste0(plotsF,todate,"_",n_perm,"_ITIModds.png"), 
+       width = 15, height = 10)
+}
+
+df_odds %>%
+  ggplot(mapping = aes(x = gene_symbol, y = total_length)) +
+  geom_point() +
+  facet_wrap(~ known, scales = "free_x") +
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+df_odds %>%
+  filter(actual_ITIM > 0) %>%
+  ggplot(mapping = aes(x = log2(total_length), y = total_odds)) +
+  facet_wrap(~ known, scales = "free_x") +
+  geom_point(mapping = aes(color = odds_filt)) +
+  geom_hline(yintercept = 0.25) +
+  scale_color_manual(values = c("gray50","black")) +
+  geom_smooth(method = "glm") +
+  guides(color = "none") +
+  theme_minimal() +  
+  xlab("intracellular domain length") +
+  ylab("ITIM likelihood")
+
+df_odds %>%
+  filter(actual_ITIM > 0) %>%
+  ggplot(mapping = aes(x = odds_filt, y = total_length)) +
+  stat_boxplot(geom = "errorbar", width = 0.2) +
+  geom_boxplot(outlier.shape = NA, width = 0.6) +
+  geom_jitter(width = 0.25, size = 1,
+              mapping = aes(color = TMtype)) +
+  stat_compare_means(label = "p.format") +
+  theme_minimal() +
+  scale_y_log10() +
+  xlab("inclusion/exclusion") +
+  ylab("total intracellular domain length")
+
+```
+
+## filter out the odds
+
+```{r}
+
+df_odds_filt <- df_odds %>%
+  filter(odds_filt == "incl")
+
+saveRDS(df_odds_filt, paste0(processedF, todate,"_",n_perm,"_ITIModds_filt.rds"))
+
+df_odds_filt %>% 
+  filter(known == "unknown",
+         !duplicated(gene_symbol)) %>%
+  group_by(TMtype) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n/sum(n)*100)
+
+```
+
+## export files for AlphaFold
+
+```{r eval = FALSE}
+
+topologies_innerITIM %>%
+  left_join(annotation_all, by = "peptide_id") %>% 
+  filter(!duplicated(peptide_id)) %>% 
+  mutate(peptide_gene = paste(peptide_id, gene_symbol, sep = "_")) %>% 
+  select(peptide_gene, psequence) %>%
+  as.data.frame() %>% 
+  exportFASTA(paste0(outputF,todate,"_all_AF_sequences_incl_nogene.txt"))
+
+df_odds %>% 
+  select(peptide_gene, psequence) %>%
+  as.data.frame() %>% 
+  exportFASTA(paste0(outputF,todate,"_all_AF_sequences.txt"))
+
+df_odds %>%
+  filter(odds_filt == "incl") %>%
+  select(peptide_gene, psequence) %>% 
+  as.data.frame() %>% 
+  exportFASTA(paste0(outputF,todate,"_AF_sequences_subtresh.txt"))
+
+df_odds %>%
+  filter(!odds_filt == "incl") %>% 
+  select(peptide_gene, psequence) %>%
+  as.data.frame() %>% 
+  exportFASTA(paste0(outputF,todate,"_all_AF_sequences_abovetresh.txt"))
+
+```
+
+
+
+## AlphaFold file
+
+next we will load in alphafold files
+
+```{r}
+
+AlphaFolder <- "D:/AlphaFold/new/"
+
+pdb_files <- paste0(AlphaFolder,list.files(AlphaFolder),"/ranked_0.pdb")
+
+confidence_scores <- list()
+df_AF <- list()
+
+for(i in 1:nrow(df_odds_filt[1:2,])){
+  gene_symbol <- df_odds_filt$gene_symbol[i]
+  peptide_id <- df_odds_filt$peptide_id[i]
+  psequence <- df_odds_filt$psequence[i]
+  topology <- df_odds_filt$topology[i]
+  print(paste("running:", gene_symbol))
+  
+  ITIM_locs <- str_locate_all(psequence, ITIMseq)[[1]]
+  inner_ITIMs <- ITIM_locs[str_sub(topology, ITIM_locs[,"start"],ITIM_locs[,"end"]) == "iiiiii",]
+  
+  find_pdb <- str_detect(pdb_files, peptide_id)
+  if(any(find_pdb)){
+    pdb <- read.pdb(pdb_files[find_pdb])
+
+    conf_scores <- pdb$atom %>%
+     distinct(resno, b) %>%
+      pull(b)
+    
+    if(length(inner_ITIMs) == 0){
+      print("no ITIMs?")
+      break()
+    }
+  
+    if (!length(inner_ITIMs) == 2){
+      print(paste("nr of ITIMs:", length(inner_ITIMs)/2))
+      means <- c()
+      for (j in 1:nrow(inner_ITIMs)){
+        print(paste("j:", j))
+        means <- c(means, mean(conf_scores[inner_ITIMs[j, "start"]:inner_ITIMs[j, "end"]]))
+     }
+      confidence_scores[[i]] <- means
+    } else if(length(inner_ITIMs) == 2) {
+      print(paste("nr of ITIMs:", length(inner_ITIMs)/2))
+      confidence_scores[[i]] <- mean(conf_scores[inner_ITIMs["start"]:inner_ITIMs["end"]])
+    }
+    print(paste("confidence score(s):", confidence_scores[[i]]))
+    df_AF[[i]] <- c(gene_symbol,confidence_scores[[i]])
+    names(df_AF)[i] <- gene_symbol
+  
+    print(paste(i,"/",nrow(df_odds_filt),"sequences done - ", gene_symbol))
+    
+    }else{
+      print(".pdb file not found")
+      df_AF[[i]] <- NA
+      names(df_AF)[i] <- gene_symbol
+      #break()
+    }
+}
+
+df_AF_all <- df_AF %>%
+  append(list(1:5)) %>%  
+  as_tibble_col("ITIM") %>% 
+  unnest_wider(ITIM,names_sep = "") %>% 
+  mutate(peptide_gene = c(names(df_AF),1))
+
+
+
+```
+
