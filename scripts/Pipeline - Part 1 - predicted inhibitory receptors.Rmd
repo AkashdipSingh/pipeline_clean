@@ -29,7 +29,7 @@ library(readxl)
 library(ggpubr)
 
 todate <- format(Sys.Date(),"%y%m%d")
-todate <- 221218
+todate <- 221219
 
 dataF <- file.path("./data",todate,"/")
 plotsF <- file.path("./plots",todate,"/")
@@ -47,6 +47,8 @@ knownr <- read_lines("./data/known_receptors.txt")
 ensembl <- useMart("ensembl",
                    host = "https://dec2021.archive.ensembl.org",
                    dataset = "hsapiens_gene_ensembl")
+
+ITIMseq <- "[VLIST].Y..[ILV]"
 
 ```
 
@@ -119,9 +121,8 @@ First thing was to retrieve all peptide sequences from a database, went for ense
 # saveRDS(all_peptides,
 #         file = paste0("./processed/",todate,"_all_peptide_sequences.rds"))
 
-#don't want to load in again every time, takes some time
 
-ITIMseq <- "[VLIST].Y..[ILV]"
+#don't want to load in again every time, takes some time
 
 fasta_file <- paste0(outputF, todate, "_peptides_anyITIM.fa")
 if(!file.exists(fasta_file)) {
@@ -133,8 +134,9 @@ if(!file.exists(fasta_file)) {
     filter(str_detect(peptide, ITIMseq))
   rm(all_peptides)
   
-  peptides_anyITIM %>%
-    exportFASTA(fasta_file)
+  # also don't need to make FASTA for topcons every time
+  # peptides_anyITIM %>%
+  #   exportFASTA(fasta_file)
 
   saveRDS(peptides_anyITIM, paste0(processedF,"peptides_anyITIM.rds"))
 }
@@ -168,7 +170,6 @@ if(!file.exists(paste0(processedF,"topologies_anyITIM.rds"))){
     filter(grepl("M",topology)) %>%
     mutate(TMdomains = str_count(topology,"M+"))
 
-
   rm(topcons_result)
   rm(peptides_anyITIM)
   
@@ -182,9 +183,8 @@ if(!file.exists(paste0(processedF,"topologies_anyITIM.rds"))){
         file = paste0(processedF,"topologies_anyITIM.rds"))
 
 }else{
-  
   topologies_anyITIM <- readRDS(paste0(processedF,"topologies_anyITIM.rds"))
-
+  check_knowns(topologies_anyITIM$peptide_id)
 }
 
 
@@ -232,9 +232,11 @@ topologies_innerITIM %>%
 
 saveRDS(topologies_innerITIM,
         file = paste0(processedF,"topologies_innerITIM.rds"))
+check_knowns(topologies_innerITIM$peptide_id)
 
 }else{
   topologies_innerITIM <- readRDS(paste0(processedF,"topologies_innerITIM.rds"))
+  check_knowns(topologies_innerITIM$peptide_id)
 }
 
 
@@ -314,39 +316,46 @@ Had to add a fixed seed to make every run comparable
 
 ```{r}
 
-set.seed(020841)
 n_perm <- 10000
 
 if(!file.exists(paste0(processedF, "df_odds",n_perm,".rds"))){
   permut_counts <- list()
   for (i in 1:n_perm) {
-      print(paste(i,"/",n_perm,"permutations done"))
-      df_int <- df_domains %>%
-        mutate(
-          across(contains("inner_seq"),
+    set.seed(020841+i)
+    print(paste(i,"/",n_perm,"permutations done"))
+    df_int <- df_domains %>%
+      mutate(
+        across(contains("inner_seq"),
                list(permut = stri_rand_shuffle)),
-          across(contains("permut"),
+        across(contains("permut"),
                list(ITIMcount = function(x) str_count(x, ITIMseq))),
-          permut_count = rowSums(across(contains("ITIMcount")), na.rm = TRUE),
-          more = permut_count >= actual_ITIM)
+        permut_count = rowSums(across(contains("ITIMcount")), na.rm = TRUE),
+        more = permut_count >= actual_ITIM)
     
-      permut_counts[[i]] <- df_int$more
+    permut_counts[[i]] <- df_int$more
   }
-
+  
+  set.seed(020841)
+  error_epsilon <- mean(runif(n_perm, min = 0, max = 0.01))
+  threshold_adj <- 0.25+error_epsilon
+  print(threshold_adj)
+  
   df_odds <- df_int %>%
     dplyr::select(-contains(c("permut","more"))) %>% 
     unite("inner_sequences", contains("inner_seq")) %>% 
     mutate(total_odds = Reduce(`+`,permut_counts)/n_perm,
-           odds_filt = case_when(total_odds < 0.25 ~ "incl",
-                               total_odds >= 0.25 ~ "excl"),
+           odds_filt = case_when(total_odds < threshold_adj ~ "incl",
+                               total_odds >= threshold_adj ~ "excl"),
            TMtype = case_when(str_count(TM_localisation,"\\|") >= 1 ~ "multi",
                             str_count(TM_localisation,"\\|") == 0 & str_detect(topology,"^[So]") ~ "type1",
                             str_count(TM_localisation,"\\|") == 0 & str_detect(topology,"^i") ~ "type2"),
            total_length = nchar(innersequences)-(TMdomains-1))
   
   saveRDS(df_odds, paste0(processedF, "df_odds",n_perm,".rds"))
+  check_knowns(df_odds$peptide_id)
 } else {
   df_odds <- readRDS(paste0(processedF, "df_odds",n_perm,".rds"))
+  check_knowns(df_odds$peptide_id)
 }
 
 ```
@@ -362,6 +371,7 @@ df_odds %>%
          plotting = factor(plotting, levels = c("known", "single_unknown", "multi_unknown"))) %>% 
   ggplot(mapping = aes(x = gene_symbol, y = total_odds)) +
   facet_wrap(~ plotting, scales = "free_x") +
+  geom_hline(yintercept = threshold_adj, alpha = 0.2, linetype = "dotdash") +
   geom_hline(yintercept = 0.25) +
   geom_hline(yintercept = 0.05, alpha = 0.3) +
   stat_boxplot(geom = "errorbar") +
@@ -419,7 +429,9 @@ df_odds %>%
 df_odds_filt <- df_odds %>%
   filter(odds_filt == "incl")
 
-saveRDS(df_odds_filt, paste0(processedF, todate,"_",n_perm,"_ITIModds_filt.rds"))
+saveRDS(df_odds_filt, paste0(processedF, todate,"_",n_perm,"_df_odds_filt.rds"))
+
+check_knowns(df_odds_filt$peptide_id)
 
 df_odds_filt %>% 
   filter(known == "unknown",
@@ -461,77 +473,79 @@ df_odds %>%
 
 ```
 
-
-
 ## AlphaFold file
 
 next we will load in alphafold files
 
 ```{r}
 
-AlphaFolder <- "D:/AlphaFold/new/"
+if(!file.exists(paste0(processedF, "df_AF_all.rds"))){
+  AlphaFolder <- "D:/AlphaFold/new/"
 
-pdb_files <- paste0(AlphaFolder,list.files(AlphaFolder),"/ranked_0.pdb")
+  pdb_files <- paste0(AlphaFolder,list.files(AlphaFolder),"/ranked_0.pdb")
 
-confidence_scores <- list()
-df_AF <- list()
+  confidence_scores <- list()
+  df_AF <- list()
 
-for(i in 1:nrow(df_odds_filt[1:2,])){
-  gene_symbol <- df_odds_filt$gene_symbol[i]
-  peptide_id <- df_odds_filt$peptide_id[i]
-  psequence <- df_odds_filt$psequence[i]
-  topology <- df_odds_filt$topology[i]
-  print(paste("running:", gene_symbol))
+  for(i in 1:nrow(df_odds_filt[1:2,])){
+    peptide_gene <- df_odds_filt$peptide_gene[i]
+    peptide_id <- df_odds_filt$peptide_id[i]
+    psequence <- df_odds_filt$psequence[i]
+    topology <- df_odds_filt$topology[i]
+    print(paste("running:", peptide_gene))
   
-  ITIM_locs <- str_locate_all(psequence, ITIMseq)[[1]]
-  inner_ITIMs <- ITIM_locs[str_sub(topology, ITIM_locs[,"start"],ITIM_locs[,"end"]) == "iiiiii",]
+    ITIM_locs <- str_locate_all(psequence, ITIMseq)[[1]]
+    inner_ITIMs <- ITIM_locs[str_sub(topology, ITIM_locs[,"start"],ITIM_locs[,"end"]) == "iiiiii",]
   
-  find_pdb <- str_detect(pdb_files, peptide_id)
-  if(any(find_pdb)){
-    pdb <- read.pdb(pdb_files[find_pdb])
+    find_pdb <- str_detect(pdb_files, peptide_id)
+    if(any(find_pdb)){
+      pdb <- read.pdb(pdb_files[find_pdb])
 
-    conf_scores <- pdb$atom %>%
-     distinct(resno, b) %>%
-      pull(b)
+      conf_scores <- pdb$atom %>%
+      distinct(resno, b) %>%
+        pull(b)
     
-    if(length(inner_ITIMs) == 0){
-      print("no ITIMs?")
-      break()
-    }
+      if(length(inner_ITIMs) == 0){
+        print("no ITIMs?")
+        break()
+      }
   
-    if (!length(inner_ITIMs) == 2){
-      print(paste("nr of ITIMs:", length(inner_ITIMs)/2))
-      means <- c()
-      for (j in 1:nrow(inner_ITIMs)){
-        print(paste("j:", j))
-        means <- c(means, mean(conf_scores[inner_ITIMs[j, "start"]:inner_ITIMs[j, "end"]]))
-     }
-      confidence_scores[[i]] <- means
-    } else if(length(inner_ITIMs) == 2) {
-      print(paste("nr of ITIMs:", length(inner_ITIMs)/2))
-      confidence_scores[[i]] <- mean(conf_scores[inner_ITIMs["start"]:inner_ITIMs["end"]])
-    }
-    print(paste("confidence score(s):", confidence_scores[[i]]))
-    df_AF[[i]] <- c(gene_symbol,confidence_scores[[i]])
-    names(df_AF)[i] <- gene_symbol
+      if (!length(inner_ITIMs) == 2){
+        print(paste("nr of ITIMs:", length(inner_ITIMs)/2))
+        means <- c()
+        for (j in 1:nrow(inner_ITIMs)){
+          print(paste("j:", j))
+          means <- c(means, mean(conf_scores[inner_ITIMs[j, "start"]:inner_ITIMs[j, "end"]]))
+      }
+        confidence_scores[[i]] <- means
+      } else if(length(inner_ITIMs) == 2) {
+        print(paste("nr of ITIMs:", length(inner_ITIMs)/2))
+        confidence_scores[[i]] <- mean(conf_scores[inner_ITIMs["start"]:inner_ITIMs["end"]])
+      }
+      print(paste("confidence score(s):", confidence_scores[[i]]))
+      df_AF[[i]] <- c(peptide_gene,confidence_scores[[i]])
+      names(df_AF)[i] <- peptide_gene
   
-    print(paste(i,"/",nrow(df_odds_filt),"sequences done - ", gene_symbol))
+      print(paste(i,"/",nrow(df_odds_filt),"sequences done - ", peptide_gene))
     
-    }else{
-      print(".pdb file not found")
-      df_AF[[i]] <- NA
-      names(df_AF)[i] <- gene_symbol
-      #break()
-    }
+      }else{
+        print(".pdb file not found")
+        df_AF[[i]] <- NA
+        names(df_AF)[i] <- peptide_gene
+        #break()
+      }
+  }
+
+  df_AF_all <- df_AF %>% 
+    as_tibble_col("ITIM") %>% 
+    unnest_wider(ITIM,names_sep = "") %>% 
+    mutate(peptide_gene = names(df_AF))
+
+  saveRDS(df_AF_all, paste0(processedF, "df_AF_all.rds"))
+  
+}else{
+  df_AF_all <- readRDS(paste0(processedF, "df_AF_all.rds"))
 }
-
-df_AF_all <- df_AF %>%
-  append(list(1:5)) %>%  
-  as_tibble_col("ITIM") %>% 
-  unnest_wider(ITIM,names_sep = "") %>% 
-  mutate(peptide_gene = c(names(df_AF),1))
-
-
 
 ```
 
